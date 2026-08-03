@@ -1,0 +1,309 @@
+From 66f59f7ef30217adde2ab76c8c3fcd9f035e8afa Mon Sep 17 00:00:00 2001
+From: Wilson Zeng <cheng20011202@gmail.com>
+Date: Mon, 3 Aug 2026 21:51:43 +0800
+Subject: [PATCH 2/3] mm: workingset: trace MGLRU shadow creation and refault
+
+Workingset counters do not show why an MGLRU shadow entry was accepted or
+rejected at refault. In particular, the lruvec and recency checks gate
+different accounting updates, while the workingset bit selects the state
+restored to the replacement folio.
+
+Emit a trace event after packing the shadow at eviction and another after
+evaluating it at refault. Report the generation distance, decoded
+reference state, tier, eviction and refault lruvecs, and the side effects
+performed by the existing control flow.
+
+Refactor lru_gen_test_recent() to return the decoded state in one
+structure so the trace event reports the same values used by the refault
+decision. The added outcome flags only describe existing operations; no
+reclaim decision is changed.
+
+Signed-off-by: Wilson Zeng <cheng20011202@gmail.com>
+---
+ mm/workingset.c | 196 +++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 159 insertions(+), 37 deletions(-)
+
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 07e6836d0502..46356c25bdc3 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -19,6 +19,12 @@
+ #include "swap_table.h"
+ #include "internal.h"
+ 
++#define CREATE_TRACE_POINTS
++#include "workingset_trace.h"
++#undef CREATE_TRACE_POINTS
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++
+ /*
+  *		Double CLOCK lists
+  *
+@@ -230,6 +236,15 @@ static void unpack_shadow(void *shadow, int *memcgidp, pg_data_t **pgdat,
+ 	*workingsetp = workingset;
+ }
+ 
++struct lru_gen_shadow_info {
++	struct lruvec *lruvec;
++	unsigned long token;
++	unsigned long max_seq;
++	unsigned int memcg_private_id;
++	int nid;
++	bool workingset;
++};
++
+ #ifdef CONFIG_LRU_GEN
+ 
+ static void *lru_gen_eviction(struct folio *folio)
+@@ -246,7 +261,8 @@ static void *lru_gen_eviction(struct folio *folio)
+ 	int tier = lru_tier_from_refs(refs, workingset);
+ 	struct mem_cgroup *memcg;
+ 	struct pglist_data *pgdat = folio_pgdat(folio);
+-	unsigned short memcg_id;
++	unsigned short memcg_private_id;
++	void *shadow;
+ 
+ 	BUILD_BUG_ON(LRU_GEN_WIDTH + LRU_REFS_WIDTH >
+ 		     BITS_PER_LONG - max(EVICTION_SHIFT, EVICTION_SHIFT_ANON));
+@@ -260,75 +276,180 @@ static void *lru_gen_eviction(struct folio *folio)
+ 
+ 	hist = lru_hist_from_seq(min_seq);
+ 	atomic_long_add(delta, &lrugen->evicted[hist][type][tier]);
+-	memcg_id = mem_cgroup_private_id(memcg);
++	memcg_private_id = mem_cgroup_private_id(memcg);
++	shadow = pack_shadow(memcg_private_id, pgdat, token, workingset, type);
++
++	if (trace_mm_workingset_mglru_shadow_create_enabled()) {
++		struct address_space *mapping = folio_mapping(folio);
++		struct inode *inode = type && mapping ? mapping->host : NULL;
++		unsigned long packed_token = token &
++			(type ? EVICTION_MASK : EVICTION_MASK_ANON);
++		struct mm_workingset_mglru_shadow_create_trace trace = {
++			.folio = (unsigned long)folio,
++			.mapping = (unsigned long)mapping,
++			.index = folio->index,
++			.shadow = (unsigned long)shadow,
++			.nr_pages = delta,
++			.order = folio_order(folio),
++			.dev = inode && inode->i_sb ? inode->i_sb->s_dev : 0,
++			.ino = inode ? inode->i_ino : 0,
++			.memcg_id = mem_cgroup_id(memcg),
++			.memcg_private_id = memcg_private_id,
++			.nid = pgdat->node_id,
++			.type = type,
++			.min_seq = min_seq,
++			.raw_token = token,
++			.token = packed_token,
++			.eviction_seq = packed_token >> LRU_REFS_WIDTH,
++			.refs_width = LRU_REFS_WIDTH,
++			.refs = refs,
++			.workingset = workingset,
++			.tier = tier,
++			.hist = hist,
++			.evicted = atomic_long_read(&lrugen->evicted[hist][type][tier]),
++		};
++
++		trace_mm_workingset_mglru_shadow_create(&trace);
++	}
+ 	rcu_read_unlock();
+ 
+-	return pack_shadow(memcg_id, pgdat, token, workingset, type);
++	return shadow;
+ }
+ 
+ /*
+  * Tests if the shadow entry is for a folio that was recently evicted.
+- * Fills in @lruvec, @token, @workingset with the values unpacked from shadow.
++ * Fills in @info with the values unpacked from shadow and the exact masked
++ * max_seq used by the recent test.
+  */
+-static bool lru_gen_test_recent(void *shadow, struct lruvec **lruvec,
+-				unsigned long *token, bool *workingset, bool file)
++static bool lru_gen_test_recent(void *shadow, struct lru_gen_shadow_info *info,
++				bool file)
+ {
+ 	int memcg_id;
+-	unsigned long max_seq;
+ 	struct mem_cgroup *memcg;
+ 	struct pglist_data *pgdat;
+ 
+-	unpack_shadow(shadow, &memcg_id, &pgdat, token, workingset);
++	unpack_shadow(shadow, &memcg_id, &pgdat, &info->token, &info->workingset);
+ 
+ 	memcg = mem_cgroup_from_private_id(memcg_id);
+-	*lruvec = mem_cgroup_lruvec(memcg, pgdat);
++	info->lruvec = mem_cgroup_lruvec(memcg, pgdat);
++	info->memcg_private_id = memcg_id;
++	info->nid = pgdat->node_id;
+ 
+-	max_seq = READ_ONCE((*lruvec)->lrugen.max_seq);
+-	max_seq &= (file ? EVICTION_MASK : EVICTION_MASK_ANON) >> LRU_REFS_WIDTH;
++	info->max_seq = READ_ONCE(info->lruvec->lrugen.max_seq);
++	info->max_seq &= (file ? EVICTION_MASK : EVICTION_MASK_ANON) >> LRU_REFS_WIDTH;
+ 
+-	return abs_diff(max_seq, *token >> LRU_REFS_WIDTH) < MAX_NR_GENS;
++	return abs_diff(info->max_seq, info->token >> LRU_REFS_WIDTH) < MAX_NR_GENS;
+ }
+ 
+ static void lru_gen_refault(struct folio *folio, void *shadow)
+ {
+-	bool recent;
++	bool recent, same_lruvec;
++	bool refault_accounted = false;
++	bool feedback_accounted = false;
++	bool activate_accounted = false;
++	bool restore_accounted = false;
++	bool refs_restored = false;
++	bool in_fault;
+ 	int hist, tier, refs;
+-	bool workingset;
+-	unsigned long token;
+-	struct lruvec *lruvec;
+-	struct lru_gen_folio *lrugen;
++	struct lru_gen_shadow_info info;
++	struct lruvec *refault_lruvec;
++	struct lru_gen_folio *lrugen = NULL;
++	unsigned long current_min_seq;
+ 	int type = folio_is_file_lru(folio);
+ 	int delta = folio_nr_pages(folio);
+ 
+ 	rcu_read_lock();
+ 
+-	recent = lru_gen_test_recent(shadow, &lruvec, &token, &workingset, type);
+-	if (lruvec != folio_lruvec(folio))
+-		goto unlock;
++	recent = lru_gen_test_recent(shadow, &info, type);
++	refault_lruvec = folio_lruvec(folio);
++	same_lruvec = info.lruvec == refault_lruvec;
++	in_fault = lru_gen_in_fault();
++	current_min_seq = READ_ONCE(info.lruvec->lrugen.min_seq[type]);
++	hist = -1;
++	refs = (info.token & (BIT(LRU_REFS_WIDTH) - 1)) + 1;
++	tier = lru_tier_from_refs(refs, info.workingset);
+ 
+-	mod_lruvec_state(lruvec, WORKINGSET_REFAULT_BASE + type, delta);
++	if (!same_lruvec)
++		goto trace;
+ 
+-	if (!recent)
+-		goto unlock;
++	mod_lruvec_state(info.lruvec, WORKINGSET_REFAULT_BASE + type, delta);
++	refault_accounted = true;
+ 
+-	lrugen = &lruvec->lrugen;
++	if (!recent)
++		goto trace;
+ 
+-	hist = lru_hist_from_seq(READ_ONCE(lrugen->min_seq[type]));
+-	refs = (token & (BIT(LRU_REFS_WIDTH) - 1)) + 1;
+-	tier = lru_tier_from_refs(refs, workingset);
++	lrugen = &info.lruvec->lrugen;
+ 
++	current_min_seq = READ_ONCE(lrugen->min_seq[type]);
++	hist = lru_hist_from_seq(current_min_seq);
+ 	atomic_long_add(delta, &lrugen->refaulted[hist][type][tier]);
++	feedback_accounted = true;
+ 
+ 	/* see folio_add_lru() where folio_set_active() will be called */
+-	if (lru_gen_in_fault())
+-		mod_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);
++	if (in_fault) {
++		mod_lruvec_state(info.lruvec, WORKINGSET_ACTIVATE_BASE + type, delta);
++		activate_accounted = true;
++	}
+ 
+-	if (workingset) {
++	if (info.workingset) {
+ 		folio_set_workingset(folio);
+-		mod_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + type, delta);
+-	} else
++		mod_lruvec_state(info.lruvec, WORKINGSET_RESTORE_BASE + type, delta);
++		restore_accounted = true;
++	} else {
+ 		set_mask_bits(&folio->flags.f, LRU_REFS_MASK, (refs - 1UL) << LRU_REFS_PGOFF);
+-unlock:
++		refs_restored = true;
++	}
++trace:
++	if (trace_mm_workingset_mglru_shadow_refault_enabled()) {
++		struct address_space *mapping = folio_mapping(folio);
++		struct inode *inode = type && mapping ? mapping->host : NULL;
++		struct mem_cgroup *refault_memcg = folio_memcg(folio);
++		struct mm_workingset_mglru_shadow_refault_trace trace = {
++			.folio = (unsigned long)folio,
++			.mapping = (unsigned long)mapping,
++			.index = folio->index,
++			.shadow = (unsigned long)shadow,
++			.nr_pages = delta,
++			.order = folio_order(folio),
++			.dev = inode && inode->i_sb ? inode->i_sb->s_dev : 0,
++			.ino = inode ? inode->i_ino : 0,
++			.resolved_eviction_memcg_id =
++				mem_cgroup_id(lruvec_memcg(info.lruvec)),
++			.shadow_memcg_private_id = info.memcg_private_id,
++			.shadow_nid = info.nid,
++			.refault_memcg_id = mem_cgroup_id(refault_memcg),
++			.refault_memcg_private_id = mem_cgroup_private_id(refault_memcg),
++			.refault_nid = folio_pgdat(folio)->node_id,
++			.token = info.token,
++			.eviction_seq = info.token >> LRU_REFS_WIDTH,
++			.max_seq = info.max_seq,
++			.distance = abs_diff(info.max_seq, info.token >> LRU_REFS_WIDTH),
++			.current_min_seq = current_min_seq,
++			.refs_width = LRU_REFS_WIDTH,
++			.type = type,
++			.refs = refs,
++			.workingset = info.workingset,
++			.tier = tier,
++			.hist = hist,
++			.eviction_lruvec = (unsigned long)info.lruvec,
++			.refault_lruvec = (unsigned long)refault_lruvec,
++			.recent = recent,
++			.same_lruvec = same_lruvec,
++			.in_fault = in_fault,
++			.refault_accounted = refault_accounted,
++			.feedback_accounted = feedback_accounted,
++			.activate_accounted = activate_accounted,
++			.restore_accounted = restore_accounted,
++			.refs_restored = refs_restored,
++			.new_workingset = folio_test_workingset(folio),
++			.new_refs_bits = (READ_ONCE(folio->flags.f) & LRU_REFS_MASK) >>
++					 LRU_REFS_PGOFF,
++			.refaulted = feedback_accounted ?
++				atomic_long_read(&lrugen->refaulted[hist][type][tier]) : -1,
++		};
++
++		trace_mm_workingset_mglru_shadow_refault(&trace);
++	}
+ 	rcu_read_unlock();
+ }
+ 
+@@ -339,8 +460,8 @@ static void *lru_gen_eviction(struct folio *folio)
+ 	return NULL;
+ }
+ 
+-static bool lru_gen_test_recent(void *shadow, struct lruvec **lruvec,
+-				unsigned long *token, bool *workingset, bool file)
++static bool lru_gen_test_recent(void *shadow, struct lru_gen_shadow_info *info,
++				bool file)
+ {
+ 	return false;
+ }
+@@ -439,10 +560,11 @@ bool workingset_test_recent(void *shadow, bool file, bool *workingset,
+ 
+ 	if (lru_gen_enabled()) {
+ 		bool recent;
++		struct lru_gen_shadow_info info;
+ 
+ 		rcu_read_lock();
+-		recent = lru_gen_test_recent(shadow, &eviction_lruvec, &eviction,
+-					     workingset, file);
++		recent = lru_gen_test_recent(shadow, &info, file);
++		*workingset = info.workingset;
+ 		rcu_read_unlock();
+ 		return recent;
+ 	}
+-- 
+2.55.0
+

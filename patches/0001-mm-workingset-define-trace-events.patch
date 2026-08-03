@@ -1,0 +1,365 @@
+From eaf3211fb72ef5b13cc985f91daed60b70ef4631 Mon Sep 17 00:00:00 2001
+From: Wilson Zeng <cheng20011202@gmail.com>
+Date: Mon, 3 Aug 2026 21:51:00 +0800
+Subject: [PATCH 1/3] mm: workingset: define trace events for MGLRU shadow
+ entries
+
+MGLRU stores eviction state in an exceptional XArray entry. Existing
+counters expose aggregate refault activity, but they cannot correlate a
+shadow value across creation, storage, consumption and refault.
+
+Define trace events for those four stages. Carry the mapping identity,
+file index and shadow value needed to match the events, together with the
+decoded MGLRU state and refault outcome.
+
+The following patches add the tracepoint call sites.
+
+Signed-off-by: Wilson Zeng <cheng20011202@gmail.com>
+---
+ mm/workingset_trace.h | 334 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 334 insertions(+)
+ create mode 100644 mm/workingset_trace.h
+
+diff --git a/mm/workingset_trace.h b/mm/workingset_trace.h
+new file mode 100644
+index 000000000000..e6921eefddec
+--- /dev/null
++++ b/mm/workingset_trace.h
+@@ -0,0 +1,334 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM workingset
++
++#if !defined(_MM_WORKINGSET_TRACE_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _MM_WORKINGSET_TRACE_H
++
++#include <linux/tracepoint.h>
++#include <linux/types.h>
++
++#ifndef _MM_WORKINGSET_TRACE_TYPES_H
++#define _MM_WORKINGSET_TRACE_TYPES_H
++
++struct mm_workingset_mglru_shadow_create_trace {
++	unsigned long folio;
++	unsigned long mapping;
++	unsigned long index;
++	unsigned long shadow;
++	unsigned long nr_pages;
++	unsigned long min_seq;
++	unsigned long raw_token;
++	unsigned long token;
++	unsigned long eviction_seq;
++	u64 memcg_id;
++	u64 ino;
++	long evicted;
++	unsigned int order;
++	unsigned int dev;
++	unsigned int memcg_private_id;
++	unsigned int refs_width;
++	int nid;
++	int type;
++	int refs;
++	int workingset;
++	int tier;
++	int hist;
++};
++
++struct mm_workingset_file_shadow_trace {
++	unsigned long folio;
++	unsigned long mapping;
++	unsigned long index;
++	unsigned long shadow;
++	unsigned long nr_pages;
++	u64 ino;
++	unsigned int order;
++	unsigned int dev;
++	int gfp_write;
++};
++
++struct mm_workingset_mglru_shadow_refault_trace {
++	unsigned long folio;
++	unsigned long mapping;
++	unsigned long index;
++	unsigned long shadow;
++	unsigned long nr_pages;
++	unsigned long token;
++	unsigned long eviction_seq;
++	unsigned long max_seq;
++	unsigned long distance;
++	unsigned long current_min_seq;
++	unsigned long eviction_lruvec;
++	unsigned long refault_lruvec;
++	u64 resolved_eviction_memcg_id;
++	u64 refault_memcg_id;
++	u64 ino;
++	long refaulted;
++	unsigned int order;
++	unsigned int dev;
++	unsigned int shadow_memcg_private_id;
++	unsigned int refault_memcg_private_id;
++	unsigned int refs_width;
++	unsigned int new_refs_bits;
++	int shadow_nid;
++	int refault_nid;
++	int type;
++	int refs;
++	int workingset;
++	int tier;
++	int hist;
++	int recent;
++	int same_lruvec;
++	int in_fault;
++	int refault_accounted;
++	int feedback_accounted;
++	int activate_accounted;
++	int restore_accounted;
++	int refs_restored;
++	int new_workingset;
++};
++
++#endif /* _MM_WORKINGSET_TRACE_TYPES_H */
++
++TRACE_EVENT(mm_workingset_mglru_shadow_create,
++
++	TP_PROTO(const struct mm_workingset_mglru_shadow_create_trace *data),
++
++	TP_ARGS(data),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, folio)
++		__field(unsigned long, mapping)
++		__field(unsigned long, index)
++		__field(unsigned long, shadow)
++		__field(unsigned long, nr_pages)
++		__field(unsigned int, order)
++		__field(unsigned int, dev)
++		__field(u64, ino)
++		__field(u64, memcg_id)
++		__field(unsigned int, memcg_private_id)
++		__field(int, nid)
++		__field(int, type)
++		__field(unsigned long, min_seq)
++		__field(unsigned long, raw_token)
++		__field(unsigned long, token)
++		__field(unsigned long, eviction_seq)
++		__field(unsigned int, refs_width)
++		__field(int, refs)
++		__field(int, workingset)
++		__field(int, tier)
++		__field(int, hist)
++		__field(long, evicted)
++	),
++
++	TP_fast_assign(
++		__entry->folio = data->folio;
++		__entry->mapping = data->mapping;
++		__entry->index = data->index;
++		__entry->shadow = data->shadow;
++		__entry->nr_pages = data->nr_pages;
++		__entry->order = data->order;
++		__entry->dev = data->dev;
++		__entry->ino = data->ino;
++		__entry->memcg_id = data->memcg_id;
++		__entry->memcg_private_id = data->memcg_private_id;
++		__entry->nid = data->nid;
++		__entry->type = data->type;
++		__entry->min_seq = data->min_seq;
++		__entry->raw_token = data->raw_token;
++		__entry->token = data->token;
++		__entry->eviction_seq = data->eviction_seq;
++		__entry->refs_width = data->refs_width;
++		__entry->refs = data->refs;
++		__entry->workingset = data->workingset;
++		__entry->tier = data->tier;
++		__entry->hist = data->hist;
++		__entry->evicted = data->evicted;
++	),
++
++	TP_printk("folio=%#lx mapping=%#lx index=%lu shadow=%#lx nr_pages=%lu order=%u dev=%u ino=%llu memcg_id=%llu memcg_private_id=%u nid=%d type=%s min_seq=%lu raw_token=%#lx token=%#lx eviction_seq=%lu refs_width=%u refs=%d workingset=%d tier=%d hist=%d evicted=%ld",
++		  __entry->folio, __entry->mapping, __entry->index,
++		  __entry->shadow, __entry->nr_pages, __entry->order,
++		  __entry->dev, (unsigned long long)__entry->ino,
++		  (unsigned long long)__entry->memcg_id,
++		  __entry->memcg_private_id, __entry->nid,
++		  __print_symbolic(__entry->type, { 0, "anon" }, { 1, "file" }),
++		  __entry->min_seq, __entry->raw_token, __entry->token,
++		  __entry->eviction_seq,
++		  __entry->refs_width, __entry->refs, __entry->workingset,
++		  __entry->tier, __entry->hist, __entry->evicted)
++);
++
++DECLARE_EVENT_CLASS(mm_workingset_file_shadow_template,
++
++	TP_PROTO(const struct mm_workingset_file_shadow_trace *data),
++
++	TP_ARGS(data),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, folio)
++		__field(unsigned long, mapping)
++		__field(unsigned long, index)
++		__field(unsigned long, shadow)
++		__field(unsigned long, nr_pages)
++		__field(unsigned int, order)
++		__field(unsigned int, dev)
++		__field(u64, ino)
++		__field(int, gfp_write)
++	),
++
++	TP_fast_assign(
++		__entry->folio = data->folio;
++		__entry->mapping = data->mapping;
++		__entry->index = data->index;
++		__entry->shadow = data->shadow;
++		__entry->nr_pages = data->nr_pages;
++		__entry->order = data->order;
++		__entry->dev = data->dev;
++		__entry->ino = data->ino;
++		__entry->gfp_write = data->gfp_write;
++	),
++
++	TP_printk("folio=%#lx mapping=%#lx index=%lu shadow=%#lx nr_pages=%lu order=%u dev=%u ino=%llu gfp_write=%d",
++		  __entry->folio, __entry->mapping, __entry->index,
++		  __entry->shadow, __entry->nr_pages, __entry->order,
++		  __entry->dev, (unsigned long long)__entry->ino,
++		  __entry->gfp_write)
++);
++
++DEFINE_EVENT(mm_workingset_file_shadow_template,
++	mm_workingset_file_shadow_store,
++
++	TP_PROTO(const struct mm_workingset_file_shadow_trace *data),
++
++	TP_ARGS(data)
++);
++
++DEFINE_EVENT(mm_workingset_file_shadow_template,
++	mm_workingset_file_shadow_consume,
++
++	TP_PROTO(const struct mm_workingset_file_shadow_trace *data),
++
++	TP_ARGS(data)
++);
++
++TRACE_EVENT(mm_workingset_mglru_shadow_refault,
++
++	TP_PROTO(const struct mm_workingset_mglru_shadow_refault_trace *data),
++
++	TP_ARGS(data),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, folio)
++		__field(unsigned long, mapping)
++		__field(unsigned long, index)
++		__field(unsigned long, shadow)
++		__field(unsigned long, nr_pages)
++		__field(unsigned int, order)
++		__field(unsigned int, dev)
++		__field(u64, ino)
++		__field(u64, resolved_eviction_memcg_id)
++		__field(unsigned int, shadow_memcg_private_id)
++		__field(int, shadow_nid)
++		__field(u64, refault_memcg_id)
++		__field(unsigned int, refault_memcg_private_id)
++		__field(int, refault_nid)
++		__field(unsigned long, token)
++		__field(unsigned long, eviction_seq)
++		__field(unsigned long, max_seq)
++		__field(unsigned long, distance)
++		__field(unsigned long, current_min_seq)
++		__field(unsigned int, refs_width)
++		__field(int, type)
++		__field(int, refs)
++		__field(int, workingset)
++		__field(int, tier)
++		__field(int, hist)
++		__field(unsigned long, eviction_lruvec)
++		__field(unsigned long, refault_lruvec)
++		__field(int, recent)
++		__field(int, same_lruvec)
++		__field(int, in_fault)
++		__field(int, refault_accounted)
++		__field(int, feedback_accounted)
++		__field(int, activate_accounted)
++		__field(int, restore_accounted)
++		__field(int, refs_restored)
++		__field(int, new_workingset)
++		__field(unsigned int, new_refs_bits)
++		__field(long, refaulted)
++	),
++
++	TP_fast_assign(
++		__entry->folio = data->folio;
++		__entry->mapping = data->mapping;
++		__entry->index = data->index;
++		__entry->shadow = data->shadow;
++		__entry->nr_pages = data->nr_pages;
++		__entry->order = data->order;
++		__entry->dev = data->dev;
++		__entry->ino = data->ino;
++		__entry->resolved_eviction_memcg_id = data->resolved_eviction_memcg_id;
++		__entry->shadow_memcg_private_id = data->shadow_memcg_private_id;
++		__entry->shadow_nid = data->shadow_nid;
++		__entry->refault_memcg_id = data->refault_memcg_id;
++		__entry->refault_memcg_private_id = data->refault_memcg_private_id;
++		__entry->refault_nid = data->refault_nid;
++		__entry->token = data->token;
++		__entry->eviction_seq = data->eviction_seq;
++		__entry->max_seq = data->max_seq;
++		__entry->distance = data->distance;
++		__entry->current_min_seq = data->current_min_seq;
++		__entry->refs_width = data->refs_width;
++		__entry->type = data->type;
++		__entry->refs = data->refs;
++		__entry->workingset = data->workingset;
++		__entry->tier = data->tier;
++		__entry->hist = data->hist;
++		__entry->eviction_lruvec = data->eviction_lruvec;
++		__entry->refault_lruvec = data->refault_lruvec;
++		__entry->recent = data->recent;
++		__entry->same_lruvec = data->same_lruvec;
++		__entry->in_fault = data->in_fault;
++		__entry->refault_accounted = data->refault_accounted;
++		__entry->feedback_accounted = data->feedback_accounted;
++		__entry->activate_accounted = data->activate_accounted;
++		__entry->restore_accounted = data->restore_accounted;
++		__entry->refs_restored = data->refs_restored;
++		__entry->new_workingset = data->new_workingset;
++		__entry->new_refs_bits = data->new_refs_bits;
++		__entry->refaulted = data->refaulted;
++	),
++
++	TP_printk("folio=%#lx mapping=%#lx index=%lu shadow=%#lx nr_pages=%lu order=%u dev=%u ino=%llu resolved_eviction_memcg_id=%llu shadow_memcg_private_id=%u shadow_nid=%d refault_memcg_id=%llu refault_memcg_private_id=%u refault_nid=%d token=%#lx eviction_seq=%lu max_seq=%lu distance=%lu current_min_seq=%lu refs_width=%u type=%s refs=%d workingset=%d tier=%d hist=%d eviction_lruvec=%#lx refault_lruvec=%#lx recent=%d same_lruvec=%d in_fault=%d refault_accounted=%d feedback_accounted=%d activate_accounted=%d restore_accounted=%d refs_restored=%d new_workingset=%d new_refs_bits=%u refaulted=%ld",
++		  __entry->folio, __entry->mapping, __entry->index,
++		  __entry->shadow, __entry->nr_pages, __entry->order,
++		  __entry->dev, (unsigned long long)__entry->ino,
++		  (unsigned long long)__entry->resolved_eviction_memcg_id,
++		  __entry->shadow_memcg_private_id, __entry->shadow_nid,
++		  (unsigned long long)__entry->refault_memcg_id,
++		  __entry->refault_memcg_private_id, __entry->refault_nid,
++		  __entry->token, __entry->eviction_seq, __entry->max_seq,
++		  __entry->distance, __entry->current_min_seq,
++		  __entry->refs_width,
++		  __print_symbolic(__entry->type, { 0, "anon" }, { 1, "file" }),
++		  __entry->refs, __entry->workingset, __entry->tier,
++		  __entry->hist, __entry->eviction_lruvec,
++		  __entry->refault_lruvec, __entry->recent,
++		  __entry->same_lruvec, __entry->in_fault,
++		  __entry->refault_accounted, __entry->feedback_accounted,
++		  __entry->activate_accounted, __entry->restore_accounted,
++		  __entry->refs_restored, __entry->new_workingset,
++		  __entry->new_refs_bits,
++		  __entry->refaulted)
++);
++
++#endif /* _MM_WORKINGSET_TRACE_H */
++
++#undef TRACE_INCLUDE_PATH
++#define TRACE_INCLUDE_PATH ../../mm
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE workingset_trace
++
++#include <trace/define_trace.h>
+-- 
+2.55.0
+

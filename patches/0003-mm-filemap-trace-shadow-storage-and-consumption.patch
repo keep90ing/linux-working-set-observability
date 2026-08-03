@@ -1,0 +1,88 @@
+From 01dcb01c2df62c1807ea44f1ab476c4f666dc57e Mon Sep 17 00:00:00 2001
+From: Wilson Zeng <cheng20011202@gmail.com>
+Date: Mon, 3 Aug 2026 21:52:00 +0800
+Subject: [PATCH 3/3] mm: filemap: trace shadow entry storage and consumption
+
+The MGLRU eviction and refault events show when a shadow entry is created
+and evaluated, but they do not prove that the same value was stored in
+the page-cache XArray and later consumed by a replacement folio.
+
+Emit an event after page_cache_delete() stores a shadow and another when
+filemap_add_folio() receives the consumed value. Include the mapping
+identity, file index, shadow value and folio shape in both events.
+
+Together with the MGLRU creation and refault events, these tracepoints
+allow an observer to correlate the complete CREATE, STORE, CONSUME and
+REFAULT lifecycle of one shadow entry.
+
+Signed-off-by: Wilson Zeng <cheng20011202@gmail.com>
+---
+ mm/filemap.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 179f2886f8c0..930584f0a023 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -55,6 +55,11 @@
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/filemap.h>
++#undef CREATE_TRACE_POINTS
++
++#include "workingset_trace.h"
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
+ 
+ /*
+  * FIXME: remove all knowledge of the buffer layer from the core VM
+@@ -141,6 +146,22 @@ static void page_cache_delete(struct address_space *mapping,
+ 
+ 	xas_store(&xas, shadow);
+ 	xas_init_marks(&xas);
++	if (shadow && trace_mm_workingset_file_shadow_store_enabled()) {
++		struct inode *inode = mapping->host;
++		struct mm_workingset_file_shadow_trace trace = {
++			.folio = (unsigned long)folio,
++			.mapping = (unsigned long)mapping,
++			.index = folio->index,
++			.shadow = (unsigned long)shadow,
++			.nr_pages = nr,
++			.order = folio_order(folio),
++			.dev = inode && inode->i_sb ? inode->i_sb->s_dev : 0,
++			.ino = inode ? inode->i_ino : 0,
++			.gfp_write = -1,
++		};
++
++		trace_mm_workingset_file_shadow_store(&trace);
++	}
+ 
+ 	folio->mapping = NULL;
+ 	/* Leave folio->index set: truncation lookup relies upon it */
+@@ -969,6 +990,23 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
+ 		mem_cgroup_uncharge(folio);
+ 		__folio_clear_locked(folio);
+ 	} else {
++		if (shadow && trace_mm_workingset_file_shadow_consume_enabled()) {
++			struct inode *inode = mapping->host;
++			struct mm_workingset_file_shadow_trace trace = {
++				.folio = (unsigned long)folio,
++				.mapping = (unsigned long)mapping,
++				.index = folio->index,
++				.shadow = (unsigned long)shadow,
++				.nr_pages = folio_nr_pages(folio),
++				.order = folio_order(folio),
++				.dev = inode && inode->i_sb ? inode->i_sb->s_dev : 0,
++				.ino = inode ? inode->i_ino : 0,
++				.gfp_write = !!(gfp & __GFP_WRITE),
++			};
++
++			trace_mm_workingset_file_shadow_consume(&trace);
++		}
++
+ 		/*
+ 		 * The folio might have been evicted from cache only
+ 		 * recently, in which case it should be activated like
+-- 
+2.55.0
+
