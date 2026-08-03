@@ -1,0 +1,156 @@
+#!/usr/bin/env bpftrace
+// SPDX-License-Identifier: GPL-2.0
+
+BEGIN
+{
+	printf("Tracing mglru-shadow workload; press Ctrl-C after run_matrix.sh finishes.\n");
+}
+
+tracepoint:workingset:mm_workingset_mglru_shadow_create
+/comm == "mglru-shadow"/
+{
+	$key = (uint64)args->ino;
+	$shape_ok = args->type == 1 && args->order == 0 && args->nr_pages == 1;
+	/*
+	 * Every test file has a unique inode.  Use that scalar as the map key and
+	 * retain each remaining lifecycle field as a 64-bit value.  This avoids
+	 * cross-program tuple padding while still checking the full identity.
+	 */
+	@created[$key] = (uint64)$shape_ok;
+	@life_dev[$key] = (uint64)args->dev;
+	@life_index[$key] = (uint64)args->index;
+	@life_shadow[$key] = (uint64)args->shadow;
+	printf("CREATE  dev=%u ino=%llu idx=%lu shadow=0x%lx pages=%lu order=%u type=%d shape_ok=%d cg=%llu nid=%d min=%lu evseq=%lu refs_width=%u refs=%d ws=%d tier=%d evicted=%ld\n",
+	       args->dev, args->ino, args->index, args->shadow, args->nr_pages,
+	       args->order, args->type, $shape_ok, args->memcg_id, args->nid,
+	       args->min_seq, args->eviction_seq, args->refs_width, args->refs,
+	       args->workingset, args->tier, args->evicted);
+}
+
+tracepoint:workingset:mm_workingset_file_shadow_store
+/comm == "mglru-shadow"/
+{
+	$key = (uint64)args->ino;
+	$create_seen = @created[$key];
+	$identity_ok = @life_dev[$key] == (uint64)args->dev &&
+		       @life_index[$key] == (uint64)args->index &&
+		       @life_shadow[$key] == (uint64)args->shadow;
+	$stage_ok = $create_seen == 1 && $identity_ok &&
+		    args->order == 0 && args->nr_pages == 1;
+	@stored[$key] = (uint64)$stage_ok;
+	printf("STORE   dev=%u ino=%llu idx=%lu shadow=0x%lx pages=%lu order=%u create_seen=%d identity_ok=%d stage_ok=%d\n",
+	       args->dev, args->ino, args->index, args->shadow, args->nr_pages,
+	       args->order, $create_seen, $identity_ok, $stage_ok);
+}
+
+tracepoint:workingset:mm_workingset_file_shadow_consume
+/comm == "mglru-shadow"/
+{
+	$key = (uint64)args->ino;
+	$store_seen = @stored[$key];
+	$identity_ok = @life_dev[$key] == (uint64)args->dev &&
+		       @life_index[$key] == (uint64)args->index &&
+		       @life_shadow[$key] == (uint64)args->shadow;
+	$stage_ok = $store_seen == 1 && $identity_ok &&
+		    args->order == 0 && args->nr_pages == 1;
+	@consumed[$key] = (uint64)$stage_ok;
+	printf("CONSUME dev=%u ino=%llu idx=%lu shadow=0x%lx pages=%lu order=%u store_seen=%d identity_ok=%d stage_ok=%d\n",
+	       args->dev, args->ino, args->index, args->shadow, args->nr_pages,
+	       args->order, $store_seen, $identity_ok, $stage_ok);
+}
+
+tracepoint:workingset:mm_workingset_mglru_shadow_refault
+/comm == "mglru-shadow"/
+{
+	$key = (uint64)args->ino;
+	$consume_seen = @consumed[$key];
+	$identity_ok = @life_dev[$key] == (uint64)args->dev &&
+		       @life_index[$key] == (uint64)args->index &&
+		       @life_shadow[$key] == (uint64)args->shadow;
+	$lifecycle_ok = $consume_seen == 1 && $identity_ok;
+
+	if ($lifecycle_ok && args->type == 1 && args->order == 0 &&
+	    args->nr_pages == 1 && args->workingset == 0 && args->distance == 3 &&
+	    args->same_lruvec == 1 && args->recent == 1 &&
+	    args->refault_accounted == 1 && args->feedback_accounted == 1 &&
+	    args->activate_accounted == 0 && args->restore_accounted == 0 &&
+	    args->refs_restored == 1 && args->new_workingset == 0 &&
+	    args->tier == 0 && args->hist >= 0 && args->refaulted > 0) {
+		printf("PASS-A  ");
+		@case_a = count();
+	}
+	if ($lifecycle_ok && args->type == 1 && args->order == 0 &&
+	    args->nr_pages == 1 && args->workingset == 0 && args->distance == 4 &&
+	    args->same_lruvec == 1 && args->recent == 0 &&
+	    args->refault_accounted == 1 && args->feedback_accounted == 0 &&
+	    args->activate_accounted == 0 && args->restore_accounted == 0 &&
+	    args->refs_restored == 0 && args->tier == 0 && args->hist == -1 &&
+	    args->refaulted == -1) {
+		printf("PASS-B  ");
+		@case_b = count();
+	}
+	if ($lifecycle_ok && args->type == 1 && args->order == 0 &&
+	    args->nr_pages == 1 && args->workingset == 0 && args->distance < 4 &&
+	    args->same_lruvec == 0 && args->recent == 1 &&
+	    args->resolved_eviction_memcg_id != args->refault_memcg_id &&
+	    args->shadow_nid == args->refault_nid &&
+	    args->refault_accounted == 0 && args->feedback_accounted == 0 &&
+	    args->activate_accounted == 0 && args->restore_accounted == 0 &&
+	    args->refs_restored == 0 && args->tier == 0 && args->hist == -1 &&
+	    args->refaulted == -1) {
+		printf("PASS-C  ");
+		@case_c = count();
+	}
+	if ($lifecycle_ok && args->type == 1 && args->order == 0 &&
+	    args->nr_pages == 1 && args->workingset == 1 && args->distance < 4 &&
+	    args->same_lruvec == 1 && args->recent == 1 &&
+	    args->refault_accounted == 1 && args->feedback_accounted == 1 &&
+	    args->activate_accounted == 0 && args->restore_accounted == 1 &&
+	    args->refs_restored == 0 &&
+	    args->new_workingset == 1 && args->tier == 3 && args->hist >= 0 &&
+	    args->refaulted > 0) {
+		printf("PASS-D  ");
+		@case_d = count();
+	}
+
+	printf("REFAULT dev=%u ino=%llu idx=%lu shadow=0x%lx pages=%lu order=%u type=%d consume_seen=%d identity_ok=%d Ecg=%llu Rcg=%llu Enid=%d Rnid=%d Elru=0x%lx Rlru=0x%lx evseq=%lu max=%lu dist=%lu min=%lu ws=%d refs=%d tier=%d hist=%d recent=%d same=%d\n",
+	       args->dev, args->ino, args->index, args->shadow, args->nr_pages,
+	       args->order, args->type, $consume_seen, $identity_ok,
+	       args->resolved_eviction_memcg_id, args->refault_memcg_id,
+	       args->shadow_nid, args->refault_nid, args->eviction_lruvec,
+	       args->refault_lruvec, args->eviction_seq, args->max_seq,
+	       args->distance, args->current_min_seq, args->workingset,
+	       args->refs, args->tier, args->hist, args->recent,
+	       args->same_lruvec);
+	printf("OUTCOME refault=%d feedback=%d activate=%d restore=%d refs_restored=%d new_ws=%d new_refs_bits=%u refaulted=%ld in_fault=%d\n",
+	       args->refault_accounted, args->feedback_accounted,
+	       args->activate_accounted, args->restore_accounted,
+	       args->refs_restored, args->new_workingset,
+	       args->new_refs_bits, args->refaulted, args->in_fault);
+
+	delete(@created[$key]);
+	delete(@stored[$key]);
+	delete(@consumed[$key]);
+	delete(@life_dev[$key]);
+	delete(@life_index[$key]);
+	delete(@life_shadow[$key]);
+}
+
+END
+{
+	printf("\nClassification counts (each should be 1):\n");
+	print(@case_a);
+	print(@case_b);
+	print(@case_c);
+	print(@case_d);
+	clear(@case_a);
+	clear(@case_b);
+	clear(@case_c);
+	clear(@case_d);
+	clear(@created);
+	clear(@stored);
+	clear(@consumed);
+	clear(@life_dev);
+	clear(@life_index);
+	clear(@life_shadow);
+}
